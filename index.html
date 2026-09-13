@@ -744,46 +744,55 @@ var App = {
       finished = true;
       var files = out.filter(function(f) { return !!f; });
       if (sawDir) self.toast('Папки не поддерживаются — выберите PDF-файлы', '');
-      var short = files.filter(function(f) { return self._isShortName(f.name); });
-      if (short.length) {
-        self.toast('Браузер вернул короткое имя файла (' + short[0].name +
-          (short.length > 1 ? ' и ещё ' + (short.length - 1) : '') +
-          '). Поправьте имя в поле под превью или выберите файл через диалог.', '');
-      }
       done(files);
     };
     var tick = function() { pending--; if (pending <= 0) finish(); };
     for (var i = 0; i < items.length; i++) {
       (function(item, idx) {
+        var improve = function(file, names) {
+          out[idx] = self._recoverLongName(file, names);
+          tick();
+        };
         var entry = null;
         try {
           entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
         } catch(err) { entry = null; }
+        if (entry && entry.isDirectory) { sawDir = true; tick(); return; }
         if (entry && entry.isFile) {
           entry.file(function(file) {
-            out[idx] = self._recoverLongName(file, entry.name);
-            tick();
+            improve(file, [entry.name, entry.fullPath]);
           }, function() {
-            out[idx] = plainFiles[idx] || null;
-            tick();
+            improve(plainFiles[idx] || null, []);
           });
-        } else if (entry && entry.isDirectory) {
-          sawDir = true;
-          tick();
+          return;
+        }
+        var baseFile = plainFiles[idx] || null;
+        var handlePromise = null;
+        try {
+          handlePromise = item.getAsFileSystemHandle ? item.getAsFileSystemHandle() : null;
+        } catch(err) { handlePromise = null; }
+        if (handlePromise && typeof handlePromise.then === 'function') {
+          handlePromise.then(function(handle) {
+            improve(baseFile, handle && handle.kind === 'file' ? [handle.name] : []);
+          }, function() { improve(baseFile, []); });
         } else {
-          out[idx] = plainFiles[idx] || null;
-          tick();
+          improve(baseFile, []);
         }
       })(items[i], i);
     }
   },
 
-  _recoverLongName: function(file, entryName) {
-    if (!file || !entryName) return file;
-    var base = entryName.replace(/^.*[\\/]/, '');
-    if (!base || base === file.name) return file;
-    if (this._isShortName(file.name) && !this._isShortName(base)) {
-      try { return new File([file], base, { type: file.type }); } catch(err) {}
+  _recoverLongName: function(file, names) {
+    if (!file) return file;
+    if (!Array.isArray(names)) names = [names];
+    for (var i = 0; i < names.length; i++) {
+      var n = names[i];
+      if (!n) continue;
+      var base = String(n).replace(/^.*[\\/]/, '');
+      if (!base || base === file.name) continue;
+      if (this._isShortName(file.name) && !this._isShortName(base)) {
+        try { return new File([file], base, { type: file.type }); } catch(err) {}
+      }
     }
     return file;
   },
@@ -791,6 +800,30 @@ var App = {
   _isShortName: function(name) {
     if (!name) return false;
     return /^[A-Z0-9]{1,6}~\d{1,5}\.[A-Z0-9]{1,3}$/.test(name);
+  },
+
+  _tryMetaNameRecovery: function(pdf, onTitle, onNone) {
+    var self = this;
+    try {
+      pdf.getMetadata().then(function(meta) {
+        var title = meta && meta.info && meta.info.Title;
+        if (typeof title !== 'string') { onNone(); return; }
+        title = title.trim().replace(/[\r\n]+/g, ' ');
+        if (!title || title.length < 4 || title.length > 200 ||
+            /^microsoft/i.test(title) || self._isShortName(title)) {
+          onNone();
+          return;
+        }
+        if (!/\.pdf$/i.test(title)) title += '.pdf';
+        onTitle(title);
+      }).catch(function() { onNone(); });
+    } catch(e) { onNone(); }
+  },
+
+  _warnShortNameOnce: function() {
+    if (this.state._shortWarned) return;
+    this.state._shortWarned = true;
+    this.toast('Не удалось восстановить имя автоматически — поправьте его в поле под превью', '');
   },
 
   setFileName: function(v) {
@@ -829,6 +862,7 @@ var App = {
     }
     this.state.file = file;
     this.state.fileName = file.name;
+    this.state._shortWarned = false;
     this.state.signature = '';
     document.getElementById('dropZone').classList.add('has-file');
     document.getElementById('dropZone').querySelector('.upload-text').innerHTML =
@@ -894,6 +928,7 @@ var App = {
     this.state.signature = '';
     this.state.signedPdf = null;
     this.state.fileName = '';
+    this.state._shortWarned = false;
     this.state.batchFiles = valid.map(function(f) {
       return {
         file: f, name: f.name, size: f.size,
@@ -961,6 +996,14 @@ var App = {
     reader.onload = function() {
       var data = new Uint8Array(reader.result);
       pdfjsLib.getDocument({ data: data }).promise.then(function(pdf) {
+        if (self._isShortName(item.file.name) && item.name === item.file.name) {
+          self._tryMetaNameRecovery(pdf, function(title) {
+            item.name = title;
+            var inp = document.querySelector('#batchPreview .batch-item[data-idx="' + i + '"] .batch-name-input');
+            if (inp) inp.value = title;
+            self.toast('Имя восстановлено из свойств PDF: ' + title, '');
+          }, function() { self._warnShortNameOnce(); });
+        }
         pdf.getPage(1).then(function(page) {
           var rawView = page.getViewport({ scale: 1 });
           if (!rawView.width || !rawView.height) { pdf.destroy(); return; }
@@ -1097,6 +1140,17 @@ var App = {
     reader.onload = function() {
       var data = new Uint8Array(reader.result);
       pdfjsLib.getDocument({ data: data }).promise.then(function(pdf) {
+        self._tryMetaNameRecovery(pdf, function(title) {
+          if (!self.state.file || self.state.fileName !== self.state.file.name) return;
+          self.state.fileName = title;
+          var inp = document.querySelector('#fileInfo .file-name-input');
+          if (inp) inp.value = title;
+          document.getElementById('dropZone').querySelector('.upload-text').innerHTML =
+            '<strong>' + self.escapeHtml(title) + '</strong><br>' + self._formatSize(self.state.file.size);
+          self.toast('Имя восстановлено из свойств PDF: ' + title, '');
+        }, function() {
+          if (self.state.file && self._isShortName(self.state.file.name)) self._warnShortNameOnce();
+        });
         pdf.getPage(1).then(function(page) {
           var canvas = document.getElementById('pdfCanvas');
           var rawView = page.getViewport({ scale: 1 });
