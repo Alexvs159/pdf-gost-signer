@@ -804,20 +804,55 @@ var App = {
 
   _tryMetaNameRecovery: function(pdf, onTitle, onNone) {
     var self = this;
+    var finish = function(title) {
+      if (!title || title.length < 4 || title.length > 200 ||
+          /^microsoft/i.test(title) || self._isShortName(title)) {
+        onNone();
+        return;
+      }
+      if (!/\.pdf$/i.test(title)) title += '.pdf';
+      onTitle(title);
+    };
     try {
       pdf.getMetadata().then(function(meta) {
         var title = meta && meta.info && meta.info.Title;
-        if (typeof title !== 'string') { onNone(); return; }
-        title = title.trim().replace(/[\r\n]+/g, ' ');
-        if (!title || title.length < 4 || title.length > 200 ||
-            /^microsoft/i.test(title) || self._isShortName(title)) {
-          onNone();
-          return;
-        }
-        if (!/\.pdf$/i.test(title)) title += '.pdf';
-        onTitle(title);
-      }).catch(function() { onNone(); });
-    } catch(e) { onNone(); }
+        if (typeof title === 'string') title = title.trim().replace(/[\r\n]+/g, ' ');
+        if (title) { finish(title); return; }
+        self._titleFromPage(pdf, finish);
+      }).catch(function() {
+        self._titleFromPage(pdf, finish);
+      });
+    } catch(e) {
+      self._titleFromPage(pdf, finish);
+    }
+  },
+
+  _titleFromPage: function(pdf, done) {
+    try {
+      pdf.getPage(1).then(function(page) {
+        page.getTextContent().then(function(tc) {
+          var lines = {};
+          var order = [];
+          for (var i = 0; i < tc.items.length; i++) {
+            var it = tc.items[i];
+            if (!it.str || !it.str.trim()) continue;
+            var key = Math.round(it.transform[5]);
+            if (!lines[key]) { lines[key] = { text: '', h: 0 }; order.push(key); }
+            lines[key].text += it.str;
+            if (it.height) lines[key].h = Math.max(lines[key].h, it.height);
+          }
+          order.sort(function(a, b) { return b - a; });
+          var best = null;
+          for (var k = 0; k < Math.min(order.length, 8); k++) {
+            var line = lines[order[k]];
+            var t = line.text.trim().replace(/\s+/g, ' ');
+            if (t.length < 4 || t.length > 200) continue;
+            if (!best || line.h > best.h) best = { t: t, h: line.h };
+          }
+          done(best ? best.t : null);
+        }).catch(function() { done(null); });
+      }).catch(function() { done(null); });
+    } catch(e) { done(null); }
   },
 
   _warnShortNameOnce: function() {
@@ -1001,7 +1036,7 @@ var App = {
             item.name = title;
             var inp = document.querySelector('#batchPreview .batch-item[data-idx="' + i + '"] .batch-name-input');
             if (inp) inp.value = title;
-            self.toast('Имя восстановлено из свойств PDF: ' + title, '');
+            self.toast('Имя восстановлено автоматически: ' + title, '');
           }, function() { self._warnShortNameOnce(); });
         }
         pdf.getPage(1).then(function(page) {
@@ -1147,7 +1182,7 @@ var App = {
           if (inp) inp.value = title;
           document.getElementById('dropZone').querySelector('.upload-text').innerHTML =
             '<strong>' + self.escapeHtml(title) + '</strong><br>' + self._formatSize(self.state.file.size);
-          self.toast('Имя восстановлено из свойств PDF: ' + title, '');
+          self.toast('Имя восстановлено автоматически: ' + title, '');
         }, function() {
           if (self.state.file && self._isShortName(self.state.file.name)) self._warnShortNameOnce();
         });
